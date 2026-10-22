@@ -1,0 +1,17 @@
+# Python virtual environment (har koi apna khud banata hai)
+venv/
+
+# Voice models (bohat bari files, README mein download link diya hai)
+voices/
+*.onnx
+*.onnx.json
+
+# Test audio files
+*.wav
+
+# Python ki cache files
+__pycache__/
+*.pyc
+
+# Secret keys (API keys kabhi GitHub par mat daalna!)
+.env
