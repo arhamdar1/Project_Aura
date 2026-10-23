@@ -18,7 +18,7 @@ from web_search import needs_search, search_web  # Web search
 # SETTINGS
 # ==========================================================
 SAMPLE_RATE = 16000
-DURATION = 5
+DURATION = 8
 WHISPER_MODEL = "small"
 LLM_MODEL = "llama3.2:3b"
 VOICE_PATH = "voices/en_US-lessac-medium.onnx"

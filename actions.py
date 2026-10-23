@@ -1,15 +1,15 @@
 # ==========================================================
-# AURA - Phase 2.1: Actions (App Launcher)
+# AURA - Actions (App Launcher + WhatsApp Router)
 # Ye file AURA ke "haath paon" hai: jo kaam wo khud kar sakti hai.
 # ==========================================================
 
-import re            # Text saaf karne ke liye (punctuation hatana)
-import subprocess    # Windows par apps chalane ke liye
-import webbrowser    # Websites browser mein kholne ke liye
+import re                              # Text saaf karne ke liye
+import subprocess                      # Windows par apps chalane ke liye
+import webbrowser                      # Websites browser mein kholne ke liye
+from whatsapp import handle_whatsapp   # 🆕 WhatsApp messaging
 
 # ----------------------------------------------------------
 # 🖥️ APPS: "jo aap bolenge" -> "Windows ki command"
-# Naya app add karna ho to bas yahan aik line likh dein.
 # ----------------------------------------------------------
 APPS = {
     # --- Browsers ---
@@ -23,9 +23,9 @@ APPS = {
     "vscode": "code",
     "visual studio code": "code",
     "command prompt": "cmd",
-    "terminal": "wt",                    # Windows Terminal
+    "terminal": "wt",
 
-    # --- MS Office (agar laptop mein installed hai) ---
+    # --- MS Office ---
     "word": "winword",
     "microsoft word": "winword",
     "excel": "excel",
@@ -45,14 +45,14 @@ APPS = {
     "microsoft store": "ms-windows-store:",
 
     # --- Messaging ---
-    "whatsapp": "whatsapp:",             # WhatsApp Desktop
+    "whatsapp": "whatsapp:",
 }
 
 # ----------------------------------------------------------
 # 🌐 WEBSITES: "jo aap bolenge" -> "website ka link"
 # ----------------------------------------------------------
 WEBSITES = {
-    # --- 🎓 UMT (link ghalat ho to yahan apna asal link daal dein) ---
+    # --- 🎓 UMT ---
     "umt lms": "https://lms.umt.edu.pk",
     "lms": "https://lms.umt.edu.pk",
     "student portal": "https://online.umt.edu.pk",
@@ -62,7 +62,7 @@ WEBSITES = {
 
     # --- 🎵 Entertainment ---
     "youtube": "https://www.youtube.com",
-    "spotify": "https://open.spotify.com",   # Spotify app ho to APPS mein "spotify": "spotify:" daal dein
+    "spotify": "https://open.spotify.com",
     "netflix": "https://www.netflix.com",
 
     # --- 📚 Parhai / Kaam ---
@@ -94,27 +94,18 @@ WEBSITES = {
     "daraz": "https://www.daraz.pk",
 }
 
-# Wo alfaaz jo "kholne" ka hukam dete hain
 OPEN_WORDS = ["open", "launch", "start"]
 
 
 def clean_text(text):
-    """
-    Whisper aksar "Open Chrome." likhta hai (bare huroof + full stop).
-    Ye function sab chhote huroof kar deta hai aur punctuation hata deta hai.
-    Misaal: "Open Chrome." -> "open chrome"
-    """
+    """'Open Chrome.' -> 'open chrome' (chhote huroof, punctuation hatao)"""
     text = text.lower()
-    text = re.sub(r"[^\w\s]", " ", text)   # Har punctuation ko space se badlo
-    return " ".join(text.split())          # Faltu spaces hatao
+    text = re.sub(r"[^\w\s]", " ", text)
+    return " ".join(text.split())
 
 
 def find_target(text, dictionary):
-    """
-    Text mein dictionary ka koi naam dhoondta hai.
-    Lambe naam pehle check hote hain, taake "google drive" ko
-    ghalti se sirf "google" na samajh liya jaye.
-    """
+    """Text mein dictionary ka koi naam dhoondo (lambe naam pehle)."""
     padded = f" {text} "
     for name in sorted(dictionary, key=len, reverse=True):
         if f" {name} " in padded:
@@ -123,19 +114,12 @@ def find_target(text, dictionary):
 
 
 def open_thing(text):
-    """
-    Text mein app ya website dhoond kar kholta hai.
-    Jo khola, uska jawab (AURA ki boli) wapas karta hai.
-    Kuch na mila to None.
-    """
-    # Pehle apps check karo
+    """App ya website kholo. Kuch na mile to None."""
     app = find_target(text, APPS)
     if app:
-        # 'start ""' Windows ki command hai jo app ko alag se chala deti hai
         subprocess.Popen(f'start "" {APPS[app]}', shell=True)
         return f"Opening {app}."
 
-    # Phir websites check karo
     site = find_target(text, WEBSITES)
     if site:
         webbrowser.open(WEBSITES[site])
@@ -145,26 +129,27 @@ def open_thing(text):
 
 
 # ==========================================================
-# 🚦 ROUTER: AURA ka traffic police
+# 🚦 ROUTER
 # ==========================================================
 def handle_command(text):
     """
-    User ki baat dekh kar faisla karta hai:
-      - Agar koi command hai -> kaam karo aur jawab wapas do
-      - Agar command nahi    -> None wapas do (phir Llama jawab dega)
+    Command ho to kaam karo aur jawab do, warna None (phir Llama jawab dega).
     """
+    # 1) 🆕 WhatsApp message? (Sab se pehle check, taake "send whatsapp..."
+    #    ko ghalti se sirf "open whatsapp" na samjha jaye)
+    whatsapp_reply = handle_whatsapp(text)
+    if whatsapp_reply:
+        return whatsapp_reply
+
+    # 2) App ya website kholni hai?
     clean = clean_text(text)
     words = clean.split()
 
-    # Kya baat mein "open/launch/start" mein se koi lafz hai?
     if any(word in words for word in OPEN_WORDS):
         result = open_thing(clean)
         if result:
             return result
-
-        # Agar jumla hi "open" se shuru hua tha lekin app pehchana nahi gaya
         if words and words[0] in OPEN_WORDS:
             return "Sorry, I don't know how to open that yet."
 
-    # Koi command nahi mili -> Llama ko jawab dene do
     return None
