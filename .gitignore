@@ -15,3 +15,6 @@ __pycache__/
 
 # Secret keys (API keys kabhi GitHub par mat daalna!)
 .env
+
+# VS Code ki apni settings
+.vscode/

@@ -3,3 +3,6 @@ faster-whisper
 piper-tts
 sounddevice
 numpy
+tavily-python
+python-dotenv
+requests
