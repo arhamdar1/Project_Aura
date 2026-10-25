@@ -1,11 +1,16 @@
 # ============================================================
 # aura_core.py — AURA ka dimagh 🧠 (main file)
 # Flow: Suno (Whisper) -> Samjho (Router) -> Bolo (Piper)
+# Fix: English bolo to seedha English, sirf Urdu ho to translate
+#      + recording wapas fixed 8 second (smart mode optional)
 # ============================================================
 
+import difflib                # milte julte naam dhoondne ke liye ("not pad" -> "notepad")
 import io                     # awaaz ko memory mein rakhne ke liye
+import re                     # text saaf karne ke liye
 import threading              # audio lock (reminder aur recording takrayein nahi)
 import wave                   # .wav format padhne/likhne ke liye
+from collections import deque # bolne se thora pehle ki awaaz yaad rakhne ke liye
 from datetime import datetime # aaj ki date aur time
 
 import numpy as np            # audio data ke liye
@@ -23,6 +28,19 @@ from student_tools import handle_student, set_speaker as set_student_speaker   #
 from umt import handle_umt, start_auto_sync, set_speaker as set_umt_speaker    # UMT LMS
 from web_search import needs_search, search_web           # Tavily web search
 
+# Apps/websites ke saare naam (fuzzy match ke liye)
+try:
+    from actions import ALL_TARGETS
+except Exception:
+    ALL_TARGETS = []
+
+# Speaker mute karne ke liye (system_control wala volume control)
+try:
+    from system_control import get_volume_control
+    VOLUME_OK = True
+except Exception:
+    VOLUME_OK = False
+
 # Weather module (load na ho to bhi AURA chalti rahe)
 try:
     from weather import is_weather_question, find_city, get_weather
@@ -36,28 +54,92 @@ except Exception as e:
 # SETTINGS
 # ============================================================
 LLM_MODEL = "llama3.2:3b"
-WHISPER_MODEL = "base"        # zyada accuracy chahiye to "small" (thora slow)
 VOICE_PATH = "voices/en_US-lessac-medium.onnx"
-SAMPLE_RATE = 16000           # Whisper 16000 Hz audio chahta hai
-DURATION = 8                  # kitne second record kare
 MAX_HISTORY = 11              # kitne purane messages yaad rakhe
 
+# ---- Listening (sunna) ----
+# "base"   = sab se tez, lekin accent par kamzor
+# "small"  = achha balance ✅
+# "medium" = sab se behtar accent, lekin slow
+WHISPER_MODEL = "small"
+
+# "auto"    = English ho to seedha English, Urdu/Roman Urdu ho to English mein translate 🌍
+# "english" = hamesha English samjho (translate kabhi nahi)
+LISTEN_MODE = "auto"
+ENGLISH_MIN_CHANCE = 0.25     # English ka chance itna ho to English hi maano
+
+BEAM_SIZE = 5                 # 1 = tez, 5 = zyada sahi
+
+# ---- Recording ----
+# "fixed" = hamesha FIXED_SECONDS tak record ✅ (pehle wala, bharosemand)
+# "smart" = chup hote hi ruk jaye (agar fixed pasand na aaye to try karein)
+RECORD_MODE = "fixed"
+FIXED_SECONDS = 8
+
+SAMPLE_RATE = 16000           # Whisper 16000 Hz audio chahta hai
+SILENCE_SECONDS = 1.8         # (smart) itni der chup rahein to recording khatam
+WAIT_FOR_SPEECH = 6           # (smart) itni der tak kuch na bolein to "didn't hear"
+MAX_RECORD_SECONDS = 15       # (smart) zyada se zyada itni lambi recording
+CALIBRATE_SECONDS = 0.3       # (smart) shuru mein kamre ka shor naapne ka waqt
+NOISE_MULTIPLIER = 2.5        # (smart) awaaz shor se kitni guna tez ho to "bolna" samjho
+MIN_THRESHOLD = 0.004         # (smart) bilkul khamosh kamre ke liye kam se kam had
+BLOCK_SECONDS = 0.03          # (smart) har 30 ms baad awaaz check
+
+# True = sunte waqt laptop ki awaaz mute (video/gaane ki awaaz mic mein na jaye)
+MUTE_WHILE_LISTENING = True
+
 GREETING = "Hello, I am AURA. How can I help you?"   # shuru wali greeting 👋
+
+# Whisper ko pehle se batao ke ye words aksar aayenge, taake sahi likhe
+WHISPER_HINT = ("AURA, Notepad, WhatsApp, YouTube, LMS, UMT, student portal, Chrome, "
+                "VS Code, Spotify, Bluetooth, WiFi, Pomodoro, study mode, reminder, timer.")
 
 SYSTEM_PROMPT = (
     "You are AURA (Automated Ultra-Responsive Assistant), a friendly, smart and "
     "private desktop voice assistant running fully offline on the user's laptop. "
+    "The user is from Pakistan and may mix Urdu and English. "
+    "ALWAYS reply in clear, simple English, never in Urdu or Roman Urdu. "
     "Keep answers short and clear (2-3 sentences) because they will be spoken aloud. "
     "Do not use markdown, bullet points, emojis or special symbols. "
-    "If live information is given to you, use it to answer accurately."
+    "If live information is given to you, use it to answer accurately. "
+    "Answer ONLY the user's latest message. Never repeat one of your previous answers. "
+    "If the message is unclear or looks like a misheard command, say you did not "
+    "understand and ask the user to say it again."
 )
+
+# Ye commands hain. Samajh na aayein to Llama ke paas NAHI bhejni
+COMMAND_VERBS = ("open", "close", "launch", "quit", "exit", "kill")
+FILLER_WORDS = {"the", "my", "app", "application", "please", "website", "tab", "a", "an"}
 
 
 # ============================================================
 # MODELS LOAD KARNA (sirf aik dafa, start par)
 # ============================================================
-print("⏳ Loading Whisper...")
-whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+def load_whisper():
+    """NVIDIA GPU ho to us par, warna CPU par Whisper load karo."""
+    device, compute = "cpu", "int8"
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            device, compute = "cuda", "float16"
+    except Exception:
+        pass
+
+    try:
+        model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
+    except Exception as e:
+        if device != "cuda":
+            raise
+        print(f"   ⚠️ GPU par load nahi hua ({e}), CPU use kar rahe hain")
+        device = "cpu"
+        model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+
+    print(f"   🖥️ Whisper '{WHISPER_MODEL}' chal raha hai: {device.upper()}")
+    return model
+
+
+print(f"⏳ Loading Whisper ({WHISPER_MODEL})...")
+whisper = load_whisper()
 
 print("⏳ Loading Piper voice...")
 voice = PiperVoice.load(VOICE_PATH)
@@ -71,21 +153,138 @@ audio_lock = threading.Lock()     # aik waqt mein sirf aik kaam: ya sunna ya bol
 # ============================================================
 # 1) SUNNA 🎤
 # ============================================================
-def listen():
-    with audio_lock:              # recording ke dauraan reminder intezar kare
+def mute_speakers():
+    """Laptop ki awaaz mute karo. Wapas: (volume control, pehle se mute tha ya nahi)."""
+    if not (MUTE_WHILE_LISTENING and VOLUME_OK):
+        return None, None
+    try:
+        vol = get_volume_control()
+        was_muted = bool(vol.GetMute())
+        vol.SetMute(1, None)
+        return vol, was_muted
+    except Exception as e:
+        print(f"   ⚠️ Mute nahi ho saka: {e}")
+        return None, None
+
+
+def restore_speakers(vol, was_muted):
+    """Awaaz wapas on karo (agar pehle se mute nahi thi)."""
+    if vol is None or was_muted:
+        return
+    try:
+        vol.SetMute(0, None)
+    except Exception as e:
+        print(f"   ⚠️ Unmute nahi ho saka: {e}")
+
+
+def record_fixed():
+    """Hamesha FIXED_SECONDS tak record."""
+    print("🎤 Listening... speak now!")
+    audio = sd.rec(int(FIXED_SECONDS * SAMPLE_RATE), samplerate=SAMPLE_RATE,
+                   channels=1, dtype="float32")
+    sd.wait()
+    return audio.flatten()
+
+
+def record_smart():
+    """
+    Smart recording (optional):
+    shor naapo -> bolna shuru hone ka intezar -> chup hote hi ruk jao
+    """
+    block = int(SAMPLE_RATE * BLOCK_SECONDS)
+    pre_roll = deque(maxlen=int(0.5 / BLOCK_SECONDS))   # bolne se 0.5 sec pehle ki awaaz bhi rakho
+    chunks = []
+    started = False
+    silence = 0.0
+    elapsed = 0.0
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                        blocksize=block) as stream:
+        calib = [stream.read(block)[0] for _ in range(int(CALIBRATE_SECONDS / BLOCK_SECONDS))]
+        noise = float(np.sqrt(np.mean(np.concatenate(calib) ** 2)))
+        threshold = max(noise * NOISE_MULTIPLIER, MIN_THRESHOLD)
+        print(f"   🎚️ Shor: {noise:.4f} | Had: {threshold:.4f}")
         print("🎤 Listening... speak now!")
-        audio = sd.rec(int(DURATION * SAMPLE_RATE), samplerate=SAMPLE_RATE,
-                       channels=1, dtype="float32")
-        sd.wait()
-    print("⏹️ Processing...")
+
+        while True:
+            data, _ = stream.read(block)
+            elapsed += BLOCK_SECONDS
+            level = float(np.sqrt(np.mean(data ** 2)))
+
+            if level > threshold:
+                if not started:
+                    started = True
+                    chunks.extend(pre_roll)
+                silence = 0.0
+            elif started:
+                silence += BLOCK_SECONDS
+
+            if started:
+                chunks.append(data)
+            else:
+                pre_roll.append(data)
+
+            if started and silence >= SILENCE_SECONDS:
+                break
+            if not started and elapsed >= WAIT_FOR_SPEECH:
+                break
+            if elapsed >= MAX_RECORD_SECONDS:
+                break
+
+    if not chunks:
+        return None
+    return np.concatenate(chunks).flatten()
+
+
+def english_chance(audio):
+    """
+    Whisper se pucho: is awaaz ke English hone ka kitna chance hai?
+    Wapas: (english_chance, sab se zyada chance wali zubaan, us ka chance)
+    """
+    try:
+        lang, prob, all_probs = whisper.detect_language(audio)
+        return dict(all_probs).get("en", 0.0), lang, prob
+    except Exception as e:
+        print(f"   ⚠️ Zubaan pehchan nahi saka ({e}), English maan rahe hain")
+        return 1.0, "en", 1.0
+
+
+def transcribe(audio):
+    """Awaaz -> English text. English ho to seedha, Urdu ho to translate."""
+    task, language = "transcribe", "en"
+
+    if LISTEN_MODE == "auto":
+        en, lang, prob = english_chance(audio)
+        if en >= ENGLISH_MIN_CHANCE:
+            print(f"   🌍 English ({en:.0%}) -> seedha likh rahe hain")
+        else:
+            task, language = "translate", lang
+            print(f"   🌍 {lang} ({prob:.0%}) -> English mein translate")
 
     segments, _ = whisper.transcribe(
-        audio.flatten(),
-        language="en",
-        beam_size=1,
+        audio,
+        task=task,
+        language=language,
+        beam_size=BEAM_SIZE,
         vad_filter=True,
+        condition_on_previous_text=False,       # purani baat se ghalat andaze na lagaye
+        initial_prompt=WHISPER_HINT,            # 🎯 "notepad" ko "not pad" na likhe
     )
     return " ".join(seg.text for seg in segments).strip()
+
+
+def listen():
+    with audio_lock:              # recording ke dauraan reminder intezar kare
+        vol, was_muted = mute_speakers()      # 🔇 video/gaane ki awaaz band
+        try:
+            audio = record_smart() if RECORD_MODE == "smart" else record_fixed()
+        finally:
+            restore_speakers(vol, was_muted)  # 🔊 awaaz wapas (error aaye tab bhi)
+
+    if audio is None or len(audio) < SAMPLE_RATE * 0.3:
+        return ""
+    print("⏹️ Processing...")
+    return transcribe(audio)
 
 
 # ============================================================
@@ -148,7 +347,7 @@ def think(text, context=None):
 
     if context:
         prompt = (f"Live information:\n{context}\n\n"
-                  f"Using the live information above, answer this: {text}")
+                  f"Using the live information above, answer this in English: {text}")
     else:
         prompt = text
 
@@ -166,7 +365,37 @@ def think(text, context=None):
 
 
 # ============================================================
-# 5) ROUTER 🚦: kaun sambhalega? (upar se neeche check hota hai)
+# 5) FUZZY COMMAND 🔧 ("close not pad" -> "close notepad")
+# ============================================================
+def fuzzy_command(text):
+    """
+    Open/close wali command jo pehchani nahi gayi:
+    - milta julta app/website naam ho to wahi chala do
+    - kuch na mile to "samajh nahi aaya" bolo (Llama ke paas mat bhejo)
+    """
+    words = re.sub(r"[^\w\s]", " ", text.lower()).split()
+
+    verb, rest = None, []
+    for i, w in enumerate(words[:3]):            # command shuru mein hoti hai
+        if w in COMMAND_VERBS:
+            verb = w
+            rest = [x for x in words[i + 1:] if x not in FILLER_WORDS]
+            break
+    if not verb or not rest:
+        return None
+
+    phrase = " ".join(rest)
+    for candidate in (phrase, phrase.replace(" ", "")):   # "not pad" aur "notpad" dono try
+        match = difflib.get_close_matches(candidate, ALL_TARGETS, n=1, cutoff=0.75)
+        if match:
+            print(f"   🔧 Samjha: '{phrase}' -> '{match[0]}'")
+            return handle_command(f"{verb} {match[0]}")
+
+    return f"Sorry, I couldn't find an app or website called {phrase}. Please say it again."
+
+
+# ============================================================
+# 6) ROUTER 🚦: kaun sambhalega? (upar se neeche check hota hai)
 # ============================================================
 ROUTES = [
     handle_priority,     # (a) typing + reminders/timers/alarms
@@ -176,6 +405,7 @@ ROUTES = [
     handle_student,      # (e) deadlines + study mode
     handle_daily,        # (f) YouTube, Google, music, notes, health, windows
     handle_command,      # (g) apps/websites kholna aur band karna
+    fuzzy_command,       # (h) milta julta naam / samajh na aane wali command
 ]
 
 
@@ -187,7 +417,7 @@ def process(text):
             return reply
 
     print("   🛣️ Route: Llama")
-    context = get_live_context(text)     # (h) Live data + Llama
+    context = get_live_context(text)     # (i) Live data + Llama
     return think(text, context)
 
 

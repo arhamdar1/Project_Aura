@@ -4,7 +4,7 @@
 # 3) YouTube par play              4) Google search
 # 5) Voice typing                  6) Notes / to-do list
 # 7) Laptop health                 8) Window control
-# Naya: date wale reminders ("on 9th November") + reminders.json mein save
+# Naya: YouTube chal raha hai ya ruka hai, ye dekh kar hi pause/play karta hai
 # ============================================================
 
 import ctypes             # Windows ka popup message dikhane ke liye
@@ -22,6 +22,16 @@ import pyperclip          # clipboard (voice typing ke liye)
 import pygetwindow as gw  # windows maximize/minimize
 import requests           # YouTube se pehli video dhoondne ke liye
 
+# actions.py ke browser helpers dobara use kar rahe hain (YouTube tab dhoondne ke liye)
+from actions import get_browser_windows, focus_window, window_title, MAX_TABS
+
+# Browser ke tabs "parhne" ke liye (kaunsa tab awaaz chala raha hai)
+try:
+    import uiautomation as auto
+    UIA_OK = True
+except Exception:
+    UIA_OK = False
+
 
 # ============================================================
 # SETTINGS
@@ -34,6 +44,11 @@ DEFAULT_REMINDER_TIME = (9, 0)   # (ghanta, minute) = subah 9:00
 
 # "Play a song" / "Play some music" bolne par YouTube par yehi search hoga
 FAVORITE_MUSIC = "latest Pakistani songs"
+
+# "pause the song" kis ko control kare?
+# "youtube" = hamesha YouTube tab (AURA gaane YouTube par hi chalati hai)
+# "any"     = Windows media key (jo website sab se aakhir mein baji, usay)
+MUSIC_TARGET = "youtube"
 
 # True = typing aur window commands se pehle Alt+Tab se pichli window par jao
 # (abhi aap terminal mein Enter daba kar bolte hain). Phase 3 ke baad False karenge.
@@ -470,7 +485,164 @@ def handle_typing(original_text):
 
 
 # ============================================================
-# 3) YOUTUBE PAR PLAY ▶️
+# 3) MEDIA CONTROL 🎛️ (YouTube tab ko seedha control karna)
+# ============================================================
+# YouTube ki apni shortcut keys (sirf YouTube tab saamne ho tab dabate hain)
+YOUTUBE_KEYS = {"pause": ("k",), "play": ("k",), "next": ("shift", "n"), "previous": ("shift", "p")}
+# Windows media keys (Spotify ya "any" mode ke liye)
+MEDIA_KEYS = {"pause": "playpause", "play": "playpause", "next": "nexttrack", "previous": "prevtrack"}
+# In browsers ki windows mein tabs dhoondenge
+UIA_BROWSERS = ("google chrome", "microsoft edge", "brave", "opera", "vivaldi", "chromium")
+
+
+def _walk_tabs(ctrl, depth=0, max_depth=14):
+    """Browser window ke andar ke saare tabs (web page ke andar nahi jate, woh slow hai)."""
+    if depth > max_depth:
+        return
+    try:
+        children = ctrl.GetChildren()
+    except Exception:
+        return
+    for child in children:
+        kind = child.ControlTypeName
+        if kind == "DocumentControl":        # web page ka content -> skip
+            continue
+        if kind == "TabItemControl":
+            yield child
+            continue
+        yield from _walk_tabs(child, depth + 1, max_depth)
+
+
+def find_youtube_tabs():
+    """
+    Saare YouTube tabs dhoondo.
+    Chrome tab ke naam ke saath " - Audio playing" likh deta hai jab us mein awaaz chal rahi ho
+    (wahi 🔊 nishan jo tab par nazar aata hai).
+    Wapas: [(tab, window, chal_raha_hai)]
+    """
+    if not UIA_OK:
+        return []
+    found = []
+    try:
+        for win in auto.GetRootControl().GetChildren():
+            win_name = (win.Name or "").lower()
+            if not any(b in win_name for b in UIA_BROWSERS):
+                continue
+            for tab in _walk_tabs(win):
+                tab_name = (tab.Name or "").lower()
+                if "youtube" in tab_name:
+                    found.append((tab, win, "audio playing" in tab_name))
+    except Exception as e:
+        print(f"   ⚠️ Tabs parh nahi saka: {e}")
+    return found
+
+
+def _press_on_tab(tab, win, keys):
+    """Browser saamne lao, YouTube tab par click karo, key dabao, phir sab wapas."""
+    try:
+        previous = gw.getActiveWindow()          # jahan aap the, yaad rakho
+    except Exception:
+        previous = None
+    old_mouse = pyautogui.position()
+
+    try:
+        focus_window(gw.Win32Window(win.NativeWindowHandle))   # browser window saamne
+    except Exception:
+        pass
+    time.sleep(0.3)
+    tab.Click(simulateMove=False)                # YouTube tab par click
+    time.sleep(0.5)
+    pyautogui.hotkey(*keys)
+    print(f"   🎛️ YouTube par '{'+'.join(keys)}' dabaya")
+
+    pyautogui.moveTo(old_mouse)                  # mouse wapas
+    if previous is not None and "youtube" not in window_title(previous):
+        try:
+            focus_window(previous)               # pichli window wapas
+        except Exception:
+            pass
+
+
+def bring_youtube_tab():
+    """
+    PURANA TAREEQA (backup): window title + Ctrl+Tab se YouTube tab saamne lao.
+    Sirf tab use hota hai jab tabs "parh" na sakein.
+    """
+    windows = get_browser_windows()
+    if not windows:
+        return False
+
+    for win in windows:
+        if "youtube" in window_title(win) and focus_window(win):
+            return True
+
+    for win in windows:
+        if not focus_window(win):
+            continue
+        pyautogui.hotkey("ctrl", "1")
+        time.sleep(0.3)
+        first_title = window_title(win)
+        for _ in range(MAX_TABS):
+            if "youtube" in window_title(win):
+                return True
+            pyautogui.hotkey("ctrl", "tab")
+            time.sleep(0.25)
+            if window_title(win) == first_title:
+                break
+    return False
+
+
+def control_media(action, t):
+    """
+    action: "pause" / "play" / "next" / "previous"
+    Wapas: (kaamyab?, "YouTube" / None / bolne wala message)
+    """
+    wants_youtube = has(t, "youtube") or (MUSIC_TARGET == "youtube" and not has(t, "spotify"))
+
+    if wants_youtube:
+        # ---- Naya tareeqa: tab ki halat dekh kar ----
+        tabs = find_youtube_tabs()
+        if tabs:
+            playing = [x for x in tabs if x[2]]
+            if action == "pause":
+                if not playing:
+                    return False, "YouTube is already paused."
+                tab, win, _ = playing[0]
+            elif action == "play":
+                if playing:
+                    return False, "YouTube is already playing."
+                tab, win, _ = tabs[0]
+            else:                                # next / previous
+                tab, win, _ = (playing or tabs)[0]
+            _press_on_tab(tab, win, YOUTUBE_KEYS[action])
+            return True, "YouTube"
+
+        # ---- Backup: purana tareeqa (sirf toggle) ----
+        try:
+            previous = gw.getActiveWindow()
+        except Exception:
+            previous = None
+        if bring_youtube_tab():
+            time.sleep(0.2)
+            pyautogui.hotkey(*YOUTUBE_KEYS[action])
+            print("   🎛️ YouTube (backup tareeqa) par key dabayi")
+            if previous is not None and "youtube" not in window_title(previous):
+                try:
+                    focus_window(previous)
+                except Exception:
+                    pass
+            return True, "YouTube"
+
+        if has(t, "youtube"):
+            return False, "I couldn't find a YouTube tab."
+        # YouTube nahi mila aur khaas YouTube nahi bola -> media key try karo
+
+    pyautogui.press(MEDIA_KEYS[action])
+    return True, None
+
+
+# ============================================================
+# 4) YOUTUBE PAR PLAY ▶️
 # ============================================================
 GENERIC_MUSIC = {
     "a song", "song", "songs", "some songs", "music", "some music", "a music",
@@ -511,9 +683,9 @@ def handle_youtube(t):
     rest = re.sub(r"\s*\b(?:on|in|from)\s+youtube$", "", rest).strip()
     rest = re.sub(r"\s+for me$", "", rest).strip()
 
-    if rest in RESUME_REST:
-        pyautogui.press("playpause")
-        return "Playing."
+    if rest in RESUME_REST:                  # sirf "play" -> jo ruka hai wohi chalao
+        ok, where = control_media("play", t)
+        return f"Playing on {where}." if ok and where else (where or "Playing.")
 
     if rest in GENERIC_MUSIC:
         query = FAVORITE_MUSIC
@@ -527,7 +699,7 @@ def handle_youtube(t):
 
 
 # ============================================================
-# 4) GOOGLE SEARCH 🔍
+# 5) GOOGLE SEARCH 🔍
 # ============================================================
 GOOGLE_PATTERNS = [
     r"\bsearch\s+(?:on\s+)?google\s+(?:for\s+)?(.+)",
@@ -549,7 +721,7 @@ def handle_google(t):
 
 
 # ============================================================
-# 5) MUSIC CONTROL 🎵 (pause, next, previous, resume)
+# 6) MUSIC CONTROL 🎵 (pause, next, previous, resume)
 # ============================================================
 MEDIA_WORDS = ("music", "song", "songs", "track", "video", "spotify", "playback", "audio", "youtube")
 
@@ -559,22 +731,24 @@ def handle_music(t):
         return None
 
     if has(t, "next", "skip"):
-        pyautogui.press("nexttrack")
-        return "Next track."
-    if has(t, "previous", "last", "back"):
-        pyautogui.press("prevtrack")
-        return "Previous track."
-    if has(t, "pause", "stop"):
-        pyautogui.press("playpause")
-        return "Paused."
-    if has(t, "resume", "continue", "unpause"):
-        pyautogui.press("playpause")
-        return "Playing."
-    return None
+        action, reply = "next", "Next track"
+    elif has(t, "previous", "last", "back"):
+        action, reply = "previous", "Previous track"
+    elif has(t, "pause", "stop"):
+        action, reply = "pause", "Paused"
+    elif has(t, "resume", "continue", "unpause"):
+        action, reply = "play", "Playing"
+    else:
+        return None
+
+    ok, where = control_media(action, t)
+    if not ok:
+        return where                     # "YouTube is already paused." wagera
+    return f"{reply} on {where}." if where else f"{reply}."
 
 
 # ============================================================
-# 6) NOTES / TO-DO LIST 📝
+# 7) NOTES / TO-DO LIST 📝
 # ============================================================
 LIST_WORDS = ("my list", "my notes", "to do list", "todo list", "my to do", "my todo", "shopping list")
 
@@ -645,7 +819,7 @@ def handle_notes(t):
 
 
 # ============================================================
-# 7) LAPTOP HEALTH 💻
+# 8) LAPTOP HEALTH 💻
 # ============================================================
 SKIP_PROCESSES = {"System Idle Process", "System", "Registry", "Memory Compression", ""}
 
@@ -713,7 +887,7 @@ def handle_health(t):
 
 
 # ============================================================
-# 8) WINDOW CONTROL 🪟
+# 9) WINDOW CONTROL 🪟
 # ============================================================
 def handle_window(t):
     if has(t, "minimize all", "minimise all"):

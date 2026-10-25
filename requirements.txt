@@ -9,6 +9,7 @@ requests
 pyautogui
 pygetwindow
 pyperclip
+uiautomation
 openwakeword
 pycaw
 comtypes
