@@ -1,120 +1,186 @@
-# ==========================================================
-# AURA - Phase 2.3: WhatsApp Messaging
-# "Send a WhatsApp message to Ali saying I'm on my way"
-#  -> Ali ki chat kholo, message likho, (setting ho to) bhej do
-# ==========================================================
+# ============================================================
+# whatsapp.py — AURA se WhatsApp message bhejna 💬
+# Misaal: "Send a WhatsApp message to Ali saying I'm on my way"
+# Fix: WhatsApp ka intezar + message box par click + Enter
+# ============================================================
 
-import json            # contacts.json parhne ke liye
-import os              # File check karne aur WhatsApp kholne ke liye
-import re              # Jumle se naam aur message alag karne ke liye
-import time            # WhatsApp khulne ka intezaar karne ke liye
-import urllib.parse    # Message ko link ke andar safe banane ke liye
-import pyautogui       # Enter key dabane ke liye
+import json               # contacts.json parhne ke liye
+import os                 # whatsapp:// link kholne ke liye
+import re                 # text mein words dhoondne ke liye
+import time               # wait karne ke liye
+import urllib.parse       # message ko link ke qabil banana (spaces -> %20)
+import pyautogui          # mouse click aur Enter ke liye
+import pygetwindow as gw  # WhatsApp ki window dhoondne ke liye
 
-# ----------------------------------------------------------
-# ⚙️ SETTINGS
-# ----------------------------------------------------------
 CONTACTS_FILE = "contacts.json"
 
-# False = AURA chat khol kar message likh degi, Enter AAP dabayenge (safe ✅)
-# True  = AURA khud Enter daba kar bhej degi (jab bharosa ho jaye tab)
+# True  = AURA khud message bhej degi ✅
+# False = chat khulegi, message likha hoga, Enter aap dabayenge
 AUTO_SEND = True
 
-# WhatsApp khulne mein kitne second lagte hain (laptop slow ho to barha dein)
-WAIT_SECONDS = 12
+MAX_WAIT = 15             # WhatsApp window ka zyada se zyada intezar (second)
+CHAT_LOAD_SECONDS = 3     # window aane ke baad chat load hone ka intezar
+                          # Message likha reh jaye, bheja na jaye -> isay 5 kar dein
 
-# Ye alfaaz "whatsapp" ke saath hon to message bhejne ka hukam hai
-MESSAGE_WORDS = ["message", "send", "text", "saying"]
-
-
-def simple_clean(text):
-    """
-    Chhote huroof + punctuation hatao.
-    Whisper kabhi "What's app" likh deta hai, use bhi "whatsapp" bana do.
-    """
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = " ".join(text.split())
-    text = text.replace("what s app", "whatsapp").replace("whats app", "whatsapp")
-    return text
+WHATSAPP_TITLES = {"whatsapp", "whatsapp beta"}   # asli WhatsApp window ke titles
+MESSAGE_WORDS = {"message", "send", "text", "saying", "msg"}
+SELF_WORDS = {"me", "myself", "my number", "my own number"}
 
 
+# ============================================================
+# CONTACTS
+# ============================================================
 def load_contacts():
-    """contacts.json parh kar {naam: number} wapas karta hai."""
-    if not os.path.exists(CONTACTS_FILE):
-        print("⚠️  contacts.json nahi mili!")
+    """contacts.json se naam aur numbers parho."""
+    try:
+        with open(CONTACTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {name.lower().strip(): str(num).strip() for name, num in data.items()}
+    except FileNotFoundError:
+        print("   ⚠️ contacts.json nahi mili")
         return {}
-    with open(CONTACTS_FILE, "r", encoding="utf-8") as file:
-        contacts = json.load(file)
-    # Saare naam chhote huroof mein kar do taake matching aasaan ho
-    return {name.lower(): number for name, number in contacts.items()}
+    except json.JSONDecodeError as e:
+        print(f"   ⚠️ contacts.json mein ghalti hai (comma ya quote check karein): {e}")
+        return {}
 
 
-def parse_command(text, contacts):
+def find_contact(text, contacts):
+    """Text mein contact ka naam dhoondo. Wapas: (naam, number) ya (None, None)."""
+    for word in sorted(SELF_WORDS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(word)}\b", text):
+            if "me" in contacts:
+                return "you", contacts["me"]
+            return "me", None
+
+    for name in sorted(contacts.keys(), key=len, reverse=True):
+        if re.search(rf"\b{re.escape(name)}\b", text):
+            return name, contacts[name]
+
+    return None, None
+
+
+# ============================================================
+# WHATSAPP WINDOW
+# ============================================================
+def is_whatsapp_window(win):
+    """Kya ye ASLI WhatsApp window hai? (title bilkul 'WhatsApp' ho, VS Code nahi)"""
+    try:
+        return win.title.strip().lower() in WHATSAPP_TITLES
+    except Exception:
+        return False
+
+
+def get_whatsapp_window():
+    """Asli, nazar aane wali WhatsApp window wapas do (ya None)."""
+    candidates = [w for w in gw.getAllWindows() if is_whatsapp_window(w)]
+
+    for w in candidates:
+        try:
+            if w.isMinimized:
+                w.restore()          # minimize ho to wapas bara karo
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+    # Chhupi hui chhoti windows chhor do, sirf asli bari window lo
+    visible = [w for w in candidates if w.width > 300 and w.height > 300]
+    if not visible:
+        return None
+    return max(visible, key=lambda w: w.width * w.height)
+
+
+def wait_for_whatsapp():
+    """WhatsApp window aane tak ruko (MAX_WAIT second tak)."""
+    start = time.time()
+    while time.time() - start < MAX_WAIT:
+        win = get_whatsapp_window()
+        if win:
+            return win
+        time.sleep(0.5)
+    return None
+
+
+def click_and_send(win):
     """
-    Jumle se 2 cheezein nikaalta hai:
-      - name:    kisko bhejna hai (contacts mein se)
-      - message: kya bhejna hai ("saying" ya "that" ke baad wala hissa)
+    Message box par click karo (WhatsApp saamne aa jata hai aur cursor box mein),
+    phir Enter dabao. Mouse wapas purani jagah par.
     """
-    # "saying" ya "that" ke baad sab kuch = message
-    match = re.search(r"\b(?:saying|that)\b\s*(.+)", text, re.IGNORECASE)
-    if not match:
-        return None, None
+    old_mouse = pyautogui.position()           # mouse kahan tha, yaad rakho
 
-    message = match.group(1).strip().rstrip(".")
+    # Message box window ke bilkul neeche hota hai, darmiyan se thora daen
+    x = win.left + int(win.width * 0.65)
+    y = win.top + win.height - 40
+    print(f"   🖱️ Clicking message box at ({x}, {y})")
 
-    # "saying" se pehle wale hisse mein contact ka naam dhoondo
-    before = f" {simple_clean(text[:match.start()])} "
-    for name in sorted(contacts, key=len, reverse=True):  # Lambe naam pehle
-        if f" {name} " in before:
-            return name, message
+    pyautogui.click(x, y)
+    time.sleep(0.5)
+    pyautogui.press("enter")
+    time.sleep(0.3)
 
-    return None, message
-
-
-def send_whatsapp(name, number, message):
-    """WhatsApp Desktop mein chat kholta hai, message likhta hai, aur zaroorat ho to bhejta hai."""
-    # Message ko link ke andar safe format mein badlo (spaces -> %20 waghaira)
-    url = f"whatsapp://send?phone={number}&text={urllib.parse.quote(message)}"
-    os.startfile(url)  # Windows ko kaho ye link WhatsApp mein khole
-
-    if AUTO_SEND:
-        time.sleep(WAIT_SECONDS)   # WhatsApp khulne ka intezaar
-        pyautogui.press("enter")   # Enter daba kar bhej do
-        return f"Message sent to {name}."
-
-    return f"I have opened {name}'s chat with your message. Press Enter to send it."
+    pyautogui.moveTo(old_mouse)                # mouse wapas
 
 
-# ==========================================================
-# 🚦 Router ke liye main function
-# ==========================================================
+# ============================================================
+# MAIN FUNCTION: aura_core.py isi ko call karta hai
+# ============================================================
 def handle_whatsapp(text):
     """
-    Agar ye WhatsApp message ka hukam hai -> kaam karo aur jawab do.
-    Warna None (taake baqi router apna kaam kare).
+    WhatsApp command ho to message bhejo aur AURA ka jawab wapas do.
+    Command na ho to None (sawal Llama ke paas jayega).
     """
-    clean = simple_clean(text)
-    words = clean.split()
+    lower = text.lower()
 
-    # "whatsapp" + koi message wala lafz hona zaroori hai.
-    # (Sirf "open whatsapp" ho to ye None dega, aur app khul jayegi.)
-    if "whatsapp" not in words or not any(w in words for w in MESSAGE_WORDS):
+    # 1) Kya ye WhatsApp message wali command hai?
+    if "whatsapp" not in lower:
         return None
+    if not any(w in lower for w in MESSAGE_WORDS):
+        return None   # sirf "open whatsapp", wo actions.py sambhalega
 
+    # 2) Message alag karo: "saying" ya "that" ke baad wala hissa
+    match = re.search(r"\b(saying|that says|that)\b\s*(.*)", text, re.IGNORECASE)
+    if not match or not match.group(2).strip():
+        return "What should the message say? Please say it like: send a WhatsApp message to Ali saying hello."
+
+    message = match.group(2).strip().rstrip(".")
+    before = lower[:match.start()]
+
+    # 3) Contact dhoondo
     contacts = load_contacts()
-    if not contacts:
-        return "Your contacts list is empty. Please add contacts to the contacts file first."
+    name, number = find_contact(before, contacts)
 
-    name, message = parse_command(text, contacts)
+    if name == "me" and number is None:
+        return "I don't have your own number. Please add a 'me' entry in contacts.json."
+    if number is None:
+        return "I couldn't find that person in your contacts. Please add them to contacts.json."
 
-    if not message:
-        return ("Please tell me who to message and what to say. "
-                "For example, send a WhatsApp message to Ali saying hello.")
+    # 4) WhatsApp kholo, message pehle se likha hua
+    link = f"whatsapp://send?phone={number}&text={urllib.parse.quote(message)}"
+    os.startfile(link)
 
-    if not name:
-        return "Sorry, I could not find that person in your contacts."
+    if not AUTO_SEND:
+        return f"WhatsApp is open with your message to {name}. Press Enter to send it."
 
-    print(f"   📱 To: {name} ({contacts[name]})")
-    print(f"   💬 Message: {message}")
-    return send_whatsapp(name, contacts[name], message)
+    # 5) Auto-send
+    print("   ⏳ Waiting for WhatsApp...")
+    win = wait_for_whatsapp()
+    if win is None:
+        print("   ⚠️ WhatsApp ki window nahi mili")
+        return f"I opened the chat with {name}, but couldn't find the WhatsApp window. Please press Enter to send."
+
+    print(f"   🪟 WhatsApp mil gaya: {win.width}x{win.height}")
+    time.sleep(CHAT_LOAD_SECONDS)              # chat aur message load hone do
+    click_and_send(win)
+    return f"Message sent to {name}."
+
+
+# ============================================================
+# TEST MODE: python whatsapp.py
+# ============================================================
+if __name__ == "__main__":
+    print("🧪 Test mode — command likhein (band karne ke liye 'q')")
+    while True:
+        cmd = input("\n⌨️  Command: ")
+        if cmd.strip().lower() == "q":
+            break
+        reply = handle_whatsapp(cmd)
+        print("🤖", reply if reply else "(WhatsApp command nahi thi — Llama ke paas jati)")

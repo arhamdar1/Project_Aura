@@ -13,11 +13,12 @@ voices/
 __pycache__/
 *.pyc
 
+# VS Code settings
+.vscode/
+
 # Secret keys (API keys kabhi GitHub par mat daalna!)
 .env
 
-# VS Code ki apni settings
-.vscode/
-
-# Personal contacts (phone numbers)
+# Personal data (contacts aur notes private hain)
 contacts.json
+notes.json

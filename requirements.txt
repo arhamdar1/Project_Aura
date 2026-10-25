@@ -6,3 +6,16 @@ numpy
 tavily-python
 python-dotenv
 requests
+pyautogui
+pygetwindow
+pyperclip
+openwakeword
+pycaw
+comtypes
+screen-brightness-control
+psutil
+pillow
+winrt-runtime
+winrt-Windows.Devices.Radios
+winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections
