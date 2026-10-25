@@ -19,6 +19,12 @@ __pycache__/
 # Secret keys (API keys kabhi GitHub par mat daalna!)
 .env
 
-# Personal data (contacts aur notes private hain)
+# Personal data (contacts, notes, deadlines, reminders private hain)
 contacts.json
 notes.json
+deadlines.json
+reminders.json
+
+# UMT: browser ki login cookies + LMS cache (bilkul private)
+browser_profile/
+lms_cache.json

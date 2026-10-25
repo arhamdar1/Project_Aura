@@ -19,6 +19,8 @@ from actions import handle_command                        # apps/websites kholna
 from whatsapp import handle_whatsapp                      # WhatsApp message
 from system_control import handle_system                  # volume, brightness, wifi, files
 from daily_tools import handle_priority, handle_daily, set_speaker   # reminders, music, notes...
+from student_tools import handle_student, set_speaker as set_student_speaker   # deadlines, study mode
+from umt import handle_umt, start_auto_sync, set_speaker as set_umt_speaker    # UMT LMS
 from web_search import needs_search, search_web           # Tavily web search
 
 # Weather module (load na ho to bhi AURA chalti rahe)
@@ -105,8 +107,10 @@ def speak(text):
         sd.wait()
 
 
-# Reminders ko bolne ke liye speak() de do
+# Reminders, study mode aur LMS ko bolne ke liye speak() de do
 set_speaker(speak)
+set_student_speaker(speak)
+set_umt_speaker(speak)
 
 
 # ============================================================
@@ -167,9 +171,11 @@ def think(text, context=None):
 ROUTES = [
     handle_priority,     # (a) typing + reminders/timers/alarms
     handle_whatsapp,     # (b) WhatsApp message
-    handle_system,       # (c) volume, brightness, wifi, bluetooth, files
-    handle_daily,        # (d) YouTube, Google, music, notes, health, windows
-    handle_command,      # (e) apps/websites kholna aur band karna
+    handle_umt,          # (c) UMT LMS + portal
+    handle_system,       # (d) volume, brightness, wifi, bluetooth, files
+    handle_student,      # (e) deadlines + study mode
+    handle_daily,        # (f) YouTube, Google, music, notes, health, windows
+    handle_command,      # (g) apps/websites kholna aur band karna
 ]
 
 
@@ -181,7 +187,7 @@ def process(text):
             return reply
 
     print("   🛣️ Route: Llama")
-    context = get_live_context(text)     # (f) Live data + Llama
+    context = get_live_context(text)     # (h) Live data + Llama
     return think(text, context)
 
 
@@ -191,6 +197,7 @@ def process(text):
 def main():
     print(f"🤖 AURA: {GREETING}")
     speak(GREETING)
+    start_auto_sync()                    # LMS background mein check hota rahega
 
     while True:
         choice = input("\n▶️ Press Enter and speak  (type 'q' to quit): ")

@@ -4,17 +4,17 @@
 # 3) YouTube par play              4) Google search
 # 5) Voice typing                  6) Notes / to-do list
 # 7) Laptop health                 8) Window control
-# Fix: awaaz wale jumle ("okay set a timer", "play a song") bhi samajhti hai
+# Naya: date wale reminders ("on 9th November") + reminders.json mein save
 # ============================================================
 
 import ctypes             # Windows ka popup message dikhane ke liye
-import json               # notes.json save karne ke liye
+import json               # notes.json aur reminders.json save karne ke liye
 import re                 # text mein patterns dhoondne ke liye
 import threading          # reminders background mein chalane ke liye
 import time               # thora wait karne ke liye
 import urllib.parse       # search words ko link ke qabil banana
 import webbrowser         # browser mein link kholna
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import psutil             # CPU, RAM, disk info
 import pyautogui          # keyboard shortcuts (media keys, Alt+Tab, Win+Left)
@@ -27,21 +27,28 @@ import requests           # YouTube se pehli video dhoondne ke liye
 # SETTINGS
 # ============================================================
 NOTES_FILE = "notes.json"
+REMINDERS_FILE = "reminders.json"
 
-# "Play a song" / "Play some music" bolne par YouTube par yehi search hoga.
-# Apni pasand likh dein, jaise "Atif Aslam songs" ya "lofi study music"
+# Sirf din/date bola, time nahi ("remind me on 9th november") -> is waqt bajega
+DEFAULT_REMINDER_TIME = (9, 0)   # (ghanta, minute) = subah 9:00
+
+# "Play a song" / "Play some music" bolne par YouTube par yehi search hoga
 FAVORITE_MUSIC = "latest Pakistani songs"
 
-# True = typing aur window commands se pehle AURA Alt+Tab se pichli window par jayegi
-# (kyun ke abhi aap terminal mein Enter daba kar bolte hain). Phase 3 ke baad False karenge.
+# True = typing aur window commands se pehle Alt+Tab se pichli window par jao
+# (abhi aap terminal mein Enter daba kar bolte hain). Phase 3 ke baad False karenge.
 SWITCH_WINDOW_FIRST = True
 
-_speaker = None   # aura_core.py yahan apna speak() deta hai (reminder bolne ke liye)
+CHECK_SECONDS = 1   # reminders har kitne second baad check hon
+
+_speaker = None     # aura_core.py yahan apna speak() deta hai
 
 
 def set_speaker(func):
+    """aura_core.py ye call karta hai. Saath mein purane saved reminders bhi load ho jate hain."""
     global _speaker
     _speaker = func
+    restore_reminders()
 
 
 # ============================================================
@@ -72,6 +79,21 @@ def clock_str(dt):
     return dt.strftime("%I:%M %p").lstrip("0")
 
 
+def format_when(dt):
+    """datetime -> 'today at 5:30 PM' / 'tomorrow at 9:00 AM' / 'on Monday, 9 November at 9:00 AM'"""
+    today = date.today()
+    d = dt.date()
+    if d == today:
+        day_part = "today"
+    elif d == today + timedelta(days=1):
+        day_part = "tomorrow"
+    elif (d - today).days < 7:
+        day_part = f"on {dt.strftime('%A')}"
+    else:
+        day_part = f"on {dt.strftime('%A')}, {dt.day} {dt.strftime('%B')}"
+    return f"{day_part} at {clock_str(dt)}"
+
+
 def go_to_previous_window():
     """Terminal se pichli window (jahan aap kaam kar rahe the) par jao."""
     if SWITCH_WINDOW_FIRST:
@@ -99,8 +121,15 @@ LIST_WORDS_R = ("what", "list", "show", "any", "how many", "tell me", "do i have
 CANCEL_WORDS = ("cancel", "delete", "remove", "stop", "clear", "turn off", "dismiss")
 CREATE_WORDS = ("set", "start", "create", "add", "remind me", "wake me", "put")
 QUESTION_WORDS = ("what is a", "what is an", "explain", "define", "how does", "meaning of")
+EVENING_WORDS = ("tonight", "evening", "night", "afternoon")
 
-REMINDERS = []   # chalte hue reminders ki list
+# Message ke shuru/aakhir se ye words hata do ("on", "to", "at" wagera)
+EDGE_WORDS = {"to", "that", "about", "of", "on", "at", "by", "for", "in", "the", "and", "please"}
+
+REMINDERS = []                    # chalte hue reminders ki list
+_reminder_lock = threading.Lock() # list ko aik waqt mein aik hi thread chhede
+_checker_started = False
+_restored = False
 
 
 def words_to_digits(t):
@@ -119,8 +148,8 @@ def parse_duration(t):
     return total or None
 
 
-def parse_clock(t):
-    """'at 5:30 pm' -> aaj (ya kal) 5:30 PM ka datetime. Na mile to None."""
+def parse_clock_parts(t):
+    """'at 5:30 pm' -> (5, 30, 'pm'). Na mile to None."""
     m = CLOCK_RE.search(t)
     if not m:
         return None
@@ -129,23 +158,72 @@ def parse_clock(t):
     ampm = (m.group(3) or "").replace(" ", "")
     if hour > 23 or minute > 59:
         return None
+    return hour, minute, ampm
 
+
+def to_24h(hour, ampm, evening):
+    """12-ghante ka time -> 24-ghante ka."""
     if ampm == "pm" and hour < 12:
-        hour += 12
+        return hour + 12
     if ampm == "am" and hour == 12:
-        hour = 0
+        return 0
+    if not ampm and evening and hour < 12:
+        return hour + 12
+    return hour
 
+
+def next_clock_time(hour, minute, ampm, evening):
+    """Aaj (ya kal) ka agla aisa waqt."""
     now = datetime.now()
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
+    target = now.replace(hour=to_24h(hour, ampm, evening), minute=minute, second=0, microsecond=0)
     # "at 5" bola (am/pm nahi) aur subah ke 5 guzar gaye -> shaam ke 5
-    if not ampm and hour <= 12 and target <= now:
+    if not ampm and not evening and hour <= 12 and target <= now:
         later = target + timedelta(hours=12)
         if later > now:
             target = later
     if target <= now:
         target += timedelta(days=1)   # aaj ka waqt guzar gaya -> kal
     return target
+
+
+def find_reminder_time(t, kind):
+    """
+    Text se reminder ka waqt nikalo.
+    Wapas: (datetime ya None, error message ya None)
+    """
+    now = datetime.now()
+
+    # (a) "in 20 minutes" / "for 1 hour"
+    seconds = parse_duration(t)
+    if seconds:
+        return now + timedelta(seconds=seconds), None
+
+    # (b) Din/date + time. Date samajhne wala code student_tools mein hai, wahi use karte hain
+    from student_tools import parse_date
+    day = parse_date(t)
+    clock = parse_clock_parts(t)
+    evening = has(t, *EVENING_WORDS)
+
+    if not day and not clock:
+        return None, None
+
+    # Aage ka din: "on 9th november", "tomorrow at 7 am", "on friday at 5"
+    if day and day != now.date():
+        if clock:
+            hour, minute, ampm = clock
+            if not ampm and not evening and kind == "reminder" and 1 <= hour < 8:
+                hour24 = hour + 12            # "on friday at 5" -> shaam 5 baje
+            else:
+                hour24 = to_24h(hour, ampm, evening)
+        else:
+            hour24, minute = DEFAULT_REMINDER_TIME   # sirf date -> subah 9 baje
+        return datetime(day.year, day.month, day.day, hour24, minute), None
+
+    # Aaj: time zaroori hai
+    if not clock:
+        return None, "What time today? Please say something like: remind me today at 5 pm to call ammi."
+    hour, minute, ampm = clock
+    return next_clock_time(hour, minute, ampm, evening), None
 
 
 def format_duration(seconds):
@@ -171,12 +249,88 @@ def strip_time_words(t):
 
 
 def extract_reminder_message(t):
-    """'remind me in 20 minutes to drink water' -> 'drink water'"""
+    """'remind me on 9th november 2026 to pay the fee' -> 'pay the fee'"""
+    from student_tools import DATE_PATTERNS
     msg = re.sub(r"^(?:(?:(?:set|add|create)\s+(?:a\s+|an\s+)?)?reminder|remind me)\s*", "", t)
     msg = strip_time_words(msg)
-    msg = re.sub(r"^(?:to|that|about|of)\s+", "", msg)
-    msg = re.sub(r"\s+(?:to|that)$", "", msg)
-    return msg.strip()
+    for pattern in DATE_PATTERNS:                       # "9th november", "friday", "tomorrow"
+        msg = re.sub(pattern, " ", msg)
+    msg = re.sub(r"\b(?:19|20)\d{2}\b", " ", msg)       # saal: "2026"
+    msg = re.sub(r"\b(?:morning|evening|afternoon|night)\b", " ", msg)
+
+    words = msg.split()
+    while words and words[0] in EDGE_WORDS:
+        words.pop(0)
+    while words and words[-1] in EDGE_WORDS:
+        words.pop()
+    return " ".join(words)
+
+
+# ---------- Save / load (reminders.json) ----------
+def _save_reminders():
+    """Lock ke andar call karein."""
+    data = [{"message": r["message"], "time": r["time"].isoformat(), "label": r["label"]}
+            for r in REMINDERS]
+    with open(REMINDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _load_reminders():
+    try:
+        with open(REMINDERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    items = []
+    for d in data:
+        try:
+            items.append({"message": d["message"], "time": datetime.fromisoformat(d["time"]),
+                          "label": d.get("label", d["message"]), "missed": False})
+        except Exception:
+            continue
+    return items
+
+
+def restore_reminders():
+    """Start par saved reminders wapas lao, aur checker chalao (sirf aik dafa)."""
+    global _restored
+    if _restored:
+        return
+    _restored = True
+    now = datetime.now()
+    with _reminder_lock:
+        for item in _load_reminders():
+            if item["time"] < now - timedelta(seconds=60):
+                item["missed"] = True        # AURA band thi aur waqt guzar gaya
+            REMINDERS.append(item)
+    if REMINDERS:
+        print(f"⏰ {len(REMINDERS)} saved reminder(s) loaded")
+    _start_checker()
+
+
+def _start_checker():
+    global _checker_started
+    if _checker_started:
+        return
+    _checker_started = True
+    threading.Thread(target=_checker_loop, daemon=True).start()
+
+
+def _checker_loop():
+    """Har second ghari dekho: kisi reminder ka waqt aa gaya?"""
+    while True:
+        now = datetime.now()
+        due = []
+        with _reminder_lock:
+            for item in REMINDERS[:]:
+                if item["time"] <= now:
+                    REMINDERS.remove(item)
+                    due.append(item)
+            if due:
+                _save_reminders()
+        for item in due:
+            _fire(item)
+        time.sleep(CHECK_SECONDS)
 
 
 def _popup(message):
@@ -187,27 +341,29 @@ def _popup(message):
 
 def _fire(item):
     """Reminder ka waqt aa gaya!"""
-    if item in REMINDERS:
-        REMINDERS.remove(item)
     message = item["message"]
-    print(f"\n⏰ REMINDER: {message}")
-    threading.Thread(target=_popup, args=(message,), daemon=True).start()
+    if item.get("missed"):
+        t = item["time"]
+        spoken = (f"You missed a reminder from {t.day} {t.strftime('%B')} at {clock_str(t)}. "
+                  f"{message or 'You asked me to remind you.'}")
+    else:
+        spoken = f"Reminder. {message or 'You asked me to remind you now.'}"
+
+    print(f"\n⏰ REMINDER: {spoken}")
+    threading.Thread(target=_popup, args=(spoken,), daemon=True).start()
     if _speaker:
         try:
-            _speaker(f"Reminder. {message}")
+            _speaker(spoken)
         except Exception as e:
             print(f"   ⚠️ Reminder bol nahi saki: {e}")
 
 
-def schedule(seconds, message, label):
-    """Background mein timer lagao. Wapas: kis waqt bajega."""
-    fire_at = datetime.now() + timedelta(seconds=seconds)
-    item = {"message": message, "time": fire_at, "label": label}
-    timer = threading.Timer(seconds, _fire, args=(item,))
-    timer.daemon = True          # AURA band ho to timer bhi band
-    item["timer"] = timer
-    REMINDERS.append(item)
-    timer.start()
+def schedule(fire_at, message, label):
+    """Naya reminder list mein daalo aur save karo."""
+    restore_reminders()   # pehle purane load ho jayen (test mode mein bhi)
+    with _reminder_lock:
+        REMINDERS.append({"message": message, "time": fire_at, "label": label, "missed": False})
+        _save_reminders()
     return fire_at
 
 
@@ -219,54 +375,69 @@ def handle_reminders(t):
         return None
     if has(t, *QUESTION_WORDS):          # "what is a timer?" sawal hai
         return None
-
-    seconds = parse_duration(t)
-    target = None if seconds else parse_clock(t)
-    has_time = bool(seconds or target)
+    restore_reminders()
+    creating = has(t, *CREATE_WORDS)
 
     # ---- Cancel: "cancel my timer", "stop the alarm" ----
-    if has(t, *CANCEL_WORDS) and not has_time:
-        count = len(REMINDERS)
-        for r in REMINDERS:
-            r["timer"].cancel()
-        REMINDERS.clear()
+    if has(t, *CANCEL_WORDS) and not creating:
+        with _reminder_lock:
+            count = len(REMINDERS)
+            REMINDERS.clear()
+            _save_reminders()
         if count == 0:
             return "There was nothing to cancel."
         return f"Cancelled {count} reminders and timers."
 
     # ---- List: "what are my reminders" ----
-    if has(t, *LIST_WORDS_R) and not has_time and not has(t, *CREATE_WORDS):
-        if not REMINDERS:
+    if has(t, *LIST_WORDS_R) and not creating:
+        with _reminder_lock:
+            items = sorted(REMINDERS, key=lambda r: r["time"])
+        if not items:
             return "You have no reminders or timers right now."
-        items = sorted(REMINDERS, key=lambda r: r["time"])
-        parts = [f"{r['label']} at {clock_str(r['time'])}" for r in items]
+        parts = [f"{r['label']}, {format_when(r['time'])}" for r in items]
         return f"You have {len(items)}: " + "; ".join(parts) + "."
 
-    if target:
-        seconds = (target - datetime.now()).total_seconds()
+    now = datetime.now()
 
     # ---- Timer: "set a timer for 10 minutes" / "timer for 5 minutes" ----
     if has(t, "timer", "timers"):
+        seconds = parse_duration(t)
         if not seconds:
             return "For how long? Please say something like: set a timer for 10 minutes."
         label = format_duration(seconds)
-        schedule(seconds, f"Your {label} timer is done.", f"{label} timer")
+        schedule(now + timedelta(seconds=seconds), f"Your {label} timer is done.", f"{label} timer")
         return f"Timer set for {label}."
 
-    # ---- Alarm: "set an alarm for 7 am" / "wake me up in 30 minutes" ----
+    # ---- Alarm: "set an alarm for 7 am" / "wake me up tomorrow at 6 am" ----
     if has(t, "alarm", "alarms", "wake me"):
-        if not seconds:
+        fire_at, error = find_reminder_time(t, "alarm")
+        if error:
+            return error
+        if not fire_at:
             return "What time? Please say something like: set an alarm for 7 am."
-        fire_at = schedule(seconds, "Wake up! This is your alarm.", "alarm")
-        return f"Alarm set for {clock_str(fire_at)}."
+        schedule(fire_at, "Wake up! This is your alarm.", "alarm")
+        return f"Alarm set for {format_when(fire_at)}."
 
-    # ---- Reminder: "remind me in 20 minutes to drink water" ----
-    if not seconds:
-        return "When should I remind you? Please say something like: remind me in 20 minutes to drink water."
-    message = extract_reminder_message(t) or "This is your reminder."
-    fire_at = schedule(seconds, message, message)
-    return (f"Okay, in {format_duration(seconds)}, at {clock_str(fire_at)}, "
-            f"I will remind you: {message}.")
+    # ---- Reminder: "remind me on 9th november to pay the fee" ----
+    fire_at, error = find_reminder_time(t, "reminder")
+    if error:
+        return error
+    if not fire_at:
+        return ("When should I remind you? Please say something like: "
+                "remind me in 20 minutes to drink water, or remind me on 9th November to pay the fee.")
+    if fire_at <= now:
+        return "That time has already passed. Please give me a time in the future."
+
+    message = extract_reminder_message(t)
+    schedule(fire_at, message, message or "reminder")
+
+    soon = ""
+    if fire_at - now < timedelta(hours=12):
+        soon = f"in {format_duration((fire_at - now).total_seconds())}, "
+    if message:
+        return f"Okay, {soon}{format_when(fire_at)}, I will remind you: {message}."
+    return (f"Okay, I will remind you {soon}{format_when(fire_at)}. Next time, tell me what it is for, "
+            f"like: remind me on 9th November to pay the fee.")
 
 
 # ============================================================
@@ -301,13 +472,11 @@ def handle_typing(original_text):
 # ============================================================
 # 3) YOUTUBE PAR PLAY ▶️
 # ============================================================
-# "play a song" jaise aam jumle -> FAVORITE_MUSIC chalega
 GENERIC_MUSIC = {
     "a song", "song", "songs", "some songs", "music", "some music", "a music",
     "any song", "something", "a random song", "random song", "some song",
     "a good song", "a nice song", "my music", "my songs", "a playlist",
 }
-# "play" / "play it" -> jo ruka hua hai wohi chalao (resume)
 RESUME_REST = {"", "it", "again", "it again"}
 
 
@@ -339,16 +508,16 @@ def handle_youtube(t):
         return None
 
     rest = m.group(1)
-    rest = re.sub(r"\s*\b(?:on|in|from)\s+youtube$", "", rest).strip()   # "on youtube" hatao
-    rest = re.sub(r"\s+for me$", "", rest).strip()                        # "for me" hatao
+    rest = re.sub(r"\s*\b(?:on|in|from)\s+youtube$", "", rest).strip()
+    rest = re.sub(r"\s+for me$", "", rest).strip()
 
-    if rest in RESUME_REST:                  # sirf "play" -> resume
+    if rest in RESUME_REST:
         pyautogui.press("playpause")
         return "Playing."
 
-    if rest in GENERIC_MUSIC:                # "play a song" -> pasandeeda music
+    if rest in GENERIC_MUSIC:
         query = FAVORITE_MUSIC
-    else:                                    # "play the song kahani suno" -> "kahani suno"
+    else:
         query = re.sub(r"^(?:a\s+|the\s+|some\s+)?(?:song|songs|music|video)\s+"
                        r"(?:called\s+|named\s+|by\s+|of\s+)?", "", rest).strip() or FAVORITE_MUSIC
 
@@ -504,7 +673,7 @@ def top_memory_apps(n=3):
 
 def handle_health(t):
     if has(t, "what is a", "what is the meaning", "explain", "define"):
-        return None   # "what is a CPU?" sawal hai, Llama jawab de
+        return None
 
     wants_cpu = has(t, "cpu", "processor")
     wants_ram = has(t, "ram") or (has(t, "memory") and not has(t, "remember"))
@@ -628,6 +797,7 @@ def handle_daily(text):
 # TEST MODE: python daily_tools.py
 # ============================================================
 if __name__ == "__main__":
+    restore_reminders()
     print("🧪 Test mode — command likhein (band karne ke liye 'q')")
     while True:
         cmd = input("\n⌨️  Command: ")
